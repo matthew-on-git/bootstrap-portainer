@@ -25,10 +25,23 @@ CONF_FILE=".install.conf"
 # Load Shared Library
 ######################################################################
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || die "Failed to resolve script directory"
-[[ -n "$SCRIPT_DIR" ]] || die "SCRIPT_DIR is empty — failed to resolve script directory"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || {
+  printf '%s\n' "bootstrap-portainer: failed to resolve script directory" >&2
+  exit 1
+}
+[[ -n "$SCRIPT_DIR" ]] || {
+  printf '%s\n' "bootstrap-portainer: SCRIPT_DIR is empty — failed to resolve script directory" >&2
+  exit 1
+}
+if [[ ! -f "${SCRIPT_DIR}/lib/log.sh" ]]; then
+  printf '%s\n' "bootstrap-portainer: missing logging library ${SCRIPT_DIR}/lib/log.sh" >&2
+  exit 1
+fi
 # shellcheck source=lib/log.sh
-source "${SCRIPT_DIR}/lib/log.sh" || die "Failed to load logging library from ${SCRIPT_DIR}/lib/log.sh"
+if ! source "${SCRIPT_DIR}/lib/log.sh"; then
+  printf '%s\n' "bootstrap-portainer: failed to load logging library ${SCRIPT_DIR}/lib/log.sh" >&2
+  exit 1
+fi
 
 ######################################################################
 # Argument Parsing
@@ -86,9 +99,10 @@ command -v docker &>/dev/null || die "Docker is not installed. Please install Do
 docker info &>/dev/null || die "Docker daemon is not running. Please start Docker."
 docker compose version &>/dev/null || die "Docker Compose plugin is not installed. Please install docker compose plugin."
 
-log_info "Checking internet connectivity..."
-curl -sf --max-time 10 https://hub.docker.com >/dev/null 2>&1 ||
-  die "Cannot reach Docker Hub — check internet connectivity"
+log_info "Checking registry HTTPS reachability (optional)..."
+if ! curl -sf --max-time 10 https://hub.docker.com >/dev/null 2>&1; then
+  log_warn "Cannot reach https://hub.docker.com — image pull may still succeed via proxy or mirror; continuing"
+fi
 
 log_info "Pre-flight checks passed"
 
@@ -122,6 +136,26 @@ valid_port() {
   local port="$1"
   [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) && return 0
   return 1
+}
+
+# Returns 0 when something is listening on TCP {port} on the host; 1 when idle or unknown.
+tcp_port_listening() {
+  local port="$1"
+  if ! command -v ss &>/dev/null; then
+    log_warn "ss not found — cannot verify whether port ${port} is listening; continuing"
+    return 1
+  fi
+  ss -ltnH 2>/dev/null | grep -qE "[.:]${port}\\b"
+}
+
+ensure_publish_ports_free_for_compose_deploy() {
+  local http="$1" edge="$2"
+  [[ "$http" != "$edge" ]] || die "HTTPS port and Edge port must differ (both are ${http})"
+
+  local p
+  for p in "$http" "$edge"; do
+    tcp_port_listening "$p" && die "TCP port ${p} is already in use — choose another value or stop the conflicting service"
+  done
 }
 
 prompt() {
@@ -191,6 +225,8 @@ if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^portainer$"; then
   log_info "Portainer started successfully"
   exit 0
 fi
+
+ensure_publish_ports_free_for_compose_deploy "$PORTAINER_HTTP_PORT" "$PORTAINER_EDGE_PORT"
 
 ######################################################################
 # Generate Docker Compose File

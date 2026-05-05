@@ -156,3 +156,9 @@ networks:
 
 - Logging functions used throughout the installer
   [`lib/log.sh:1`](../../lib/log.sh#L1)
+
+### Review Findings
+
+- [x] [Review][Patch] `die` called before `lib/log.sh` defines it — On `SCRIPT_DIR` resolution or empty-dir failure, the script invokes `die` (and `source … || die`) before `die` exists, producing a confusing error or `command not found` instead of the intended message. [install.sh:28–31](../../install.sh#L28)
+- [x] [Review][Patch] Spec I/O matrix calls for validating the custom port is **available** on the host — `valid_port` only checks numeric range; nothing tests bind conflicts (e.g. `ss`/socket probe) before writing compose and deploying. [install.sh:153–166](../../install.sh#L153)
+- [x] [Review][Patch] Internet check hard-fails if `hub.docker.com` is unreachable — First-time deploy still needs registry access for `docker compose up`, but transient HTTP/proxy issues here can block installs that would otherwise work; consider a warning or tying the check to an actual `docker compose pull` outcome. [install.sh:109–112](../../install.sh#L109)
