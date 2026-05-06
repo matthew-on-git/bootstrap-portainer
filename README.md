@@ -1,10 +1,6 @@
-# Project Name
+# bootstrap-portainer
 
-> Built with [DevRail](https://devrail.dev) `v1` standards. See [STABILITY.md](STABILITY.md) for component status.
-
-<!-- TODO: Replace with your project name and one-line description -->
-
-A new project bootstrapped from the [DevRail GitHub template](https://github.com/devrail-dev/github-repo-template).
+> Idempotent installer that deploys [Portainer CE](https://www.portainer.io/) via Docker Compose on Ubuntu 22.04 / 24.04 hosts — bootstrapping Docker Engine and the Compose v2 plugin from Docker's upstream apt repository when missing. Built with [DevRail](https://devrail.dev) `v1` standards. See [STABILITY.md](STABILITY.md) for component status.
 
 <!-- badges-start -->
 <!-- TODO: Add CI status badge: ![Lint](https://github.com/OWNER/REPO/actions/workflows/lint.yml/badge.svg) -->
@@ -37,11 +33,73 @@ The Makefile is the universal execution interface. Every target produces consist
 
 All targets except `help` and `install-hooks` delegate to the dev-toolchain Docker container (`ghcr.io/devrail-dev/dev-toolchain:v1`).
 
-## Portainer on Ubuntu
+## Bootstrapping Portainer CE
 
-On Ubuntu **22.04** or **24.04**, run `sudo ./install.sh` (or `sudo ./install.sh -y` for unattended mode). Use `./install.sh --help` for a short synopsis. If Docker Engine or the Compose v2 plugin is missing, the script configures Docker’s official apt repository and installs them, then deploys Portainer CE with Docker Compose.
+The authoritative spec is [`spec-install-script-v2.md`](_bmad-output/implementation-artifacts/spec-install-script-v2.md).
 
-When invoked via `sudo` from a normal login (i.e. `SUDO_USER` is set and is not `root`), that user is added to the **`docker`** group so they can run `docker` without sudo — log out / back in (or run `newgrp docker`) for the new group to take effect. If you ran the script directly as `root` (no `SUDO_USER`), or via a non-sudo elevation tool, the group step is skipped with a warning; you can grant access manually with `sudo usermod -aG docker <user>`.
+### Requirements
+
+- **OS:** Ubuntu **22.04** or **24.04** (detected via `/etc/os-release`)
+- **Init:** systemd — the script refuses to manage `docker.service` if `/run/systemd/system` is absent (containers without systemd, WSL with the default shim, etc.)
+- **Architecture:** `amd64`, `arm64`, `armhf`, `s390x`, or `ppc64el` (the apt channels Docker publishes for)
+- **Privilege:** the script must run as root — typically via `sudo`
+- **Network:** outbound HTTPS to `download.docker.com` (apt repo) and `registry-1.docker.io` (image pull). The reachability probe is warn-only; real failures surface during `docker compose up -d`.
+
+### Quick install
+
+```bash
+sudo ./install.sh           # interactive — accept defaults or override at the prompts
+sudo ./install.sh -y        # unattended — accept defaults / saved config without prompting
+./install.sh --help         # synopsis
+```
+
+If Docker Engine or the Compose v2 plugin is missing, the script configures Docker's official apt repository and installs `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, and `docker-compose-plugin`, then `systemctl enable --now docker`.
+
+### Configuration
+
+The first run writes `${INSTALL_DIR}/.install.conf` with the values you accepted; re-runs source it for defaults. A corrupt `.install.conf` is logged as a warning and ignored — the script falls back to in-script defaults rather than dying.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `INSTALL_DIR` | `/opt/portainer` | Holds `.install.conf` and the generated `docker-compose.yaml` |
+| `PORTAINER_HTTP_PORT` | `9443` | Host port for Portainer's HTTPS UI; mapped to container `9443` |
+| `PORTAINER_EDGE_PORT` | `8000` | Host port for Portainer's Edge tunnel; mapped to container `8000` |
+| `PORTAINER_IMAGE` | `portainer/portainer-ce:sts` | Pinned tag — `:latest` and unpinned tags are rejected at runtime regardless of source (defaults, saved config, interactive input) |
+
+### Docker group access
+
+When you invoke the script via `sudo` from a normal login (i.e. `SUDO_USER` is set, is not `root`, and matches a safe POSIX-portable username pattern), that user is added to the **`docker`** group so they can run `docker` without `sudo`. **Log out and back in (or run `newgrp docker`)** for the new group to take effect.
+
+If you ran the script directly as `root` (no `SUDO_USER`), or via a non-sudo elevation tool (`doas`, `pkexec`, `su -i`), the group step is skipped with a warning; grant access manually with `sudo usermod -aG docker <user>`.
+
+### Idempotency
+
+Re-runs are safe and cheap:
+
+- If the `portainer` container is **running** — report "already running" and exit `0` without touching the compose file or container state.
+- If the `portainer` container exists but is **stopped** — run `docker start portainer` and exit `0`.
+- Otherwise — verify the configured host ports are not already listening, generate `docker-compose.yaml`, and run `docker compose up -d`.
+
+Reconciling a changed `.install.conf` against an **existing stopped** container is intentionally out of scope — recreate the container (`docker rm portainer`) before re-running if you have changed ports.
+
+### Verification
+
+```bash
+docker ps                                       # portainer container running on the configured host ports
+curl -k https://localhost:${PORTAINER_HTTP_PORT}  # Portainer login page response
+sudo ./install.sh -y && sudo ./install.sh -y    # second run reports "already running"
+```
+
+The first plain `docker ps` (no `sudo`) only succeeds after you have logged out / back in or run `newgrp docker` so the `docker` group membership takes effect.
+
+### Troubleshooting
+
+- **`HTTPS port and Edge port must differ`** — `PORTAINER_HTTP_PORT` and `PORTAINER_EDGE_PORT` resolve to the same value. Edit `.install.conf` (or delete it and re-run) to set distinct ports.
+- **`TCP port N is already in use`** — another service is bound to one of the configured host ports. Stop it, or pick a different port at the prompt.
+- **`Docker daemon is still unreachable after start`** — the script ran `systemctl start docker` once and `docker info` still fails. Investigate with `journalctl -u docker.service`.
+- **`systemd is required (/run/systemd/system not found)`** — the host is not running systemd as init. The script does not support these environments; run Portainer manually via `docker compose` instead.
+- **`Unsupported architecture for Docker upstream apt`** — the host architecture is outside Docker's published apt channels. Install Docker manually via your distribution's packages, then re-run `install.sh`.
+- **`PORTAINER_IMAGE must not use the :latest tag`** — pin a stable tag like `portainer/portainer-ce:sts`. The contract rejects `:latest` so re-runs are reproducible.
 
 ## Configuration
 
