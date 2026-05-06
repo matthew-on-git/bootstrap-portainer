@@ -1,11 +1,14 @@
 ---
-title: 'Bootstrap Portainer CE Installation Script'
+title: 'Bootstrap Portainer CE Installation Script (v1)'
 type: 'feature'
 created: '2026-05-05'
-status: 'done'
+status: 'superseded'
 context: []
 baseline_commit: '547eafc963d67cc0b95aafc4c9b38523d16884ff'
+superseded_by: 'spec-install-script-v2.md'
 ---
+
+> **⚠ Superseded — historical record only.** This v1 contract assumed Docker was pre-installed. The product intent has been formally renegotiated; the authoritative spec is now [`spec-install-script-v2.md`](./spec-install-script-v2.md). This file is preserved unchanged below the line for traceability.
 
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
 
@@ -122,43 +125,25 @@ networks:
 **Commands:**
 - `docker ps` -- expected: `portainer` container running with ports 9443 and 8000 exposed
 - `curl -k https://localhost:9443` -- expected: Portainer login page response
-- `bash install.sh -y && bash install.sh -y` -- expected: second run reports already running (idempotent)
+- `sudo bash install.sh -y && sudo bash install.sh -y` -- expected: second run reports already running (idempotent)
 - `make check` -- expected: all linting and security checks pass
 
 ## Suggested Review Order
 
-**Entry point and core logic**
+Read [`install.sh`](../../install.sh) top-to-bottom in these sections (line numbers drift; headings are authoritative):
 
-- Main installer with idempotency, config loading, and deployment logic
-  [`install.sh:1`](../../install.sh#L1)
+**Entry point and core logic** — Banner comment, **`set -euo pipefail`**, constants, **`# Load Shared Library`** (bootstrap `SCRIPT_DIR` + **`source`** `lib/log.sh` via `printf`/exit-safe path).
 
-**Validation and error handling**
+**Validation and error handling** — **`ensure_ubuntu_supported`**, **`install_docker_engine_ubuntu`**, **`ensure_docker_daemon_and_compose`**, **`add_sudo_invoker_to_docker_group`**, registry probe (`log_warn`). **`valid_port`**, **`tcp_port_listening`**, **`ensure_publish_ports_free_for_compose_deploy`**.
 
-- Port validation and prompt functions for safe user input
-  [`install.sh:119`](../../install.sh#L119)
-- Pre-flight checks including docker compose plugin verification
-  [`install.sh:84`](../../install.sh#L84)
-- SCRIPT_DIR resolution and library loading with error handling
-  [`install.sh:28`](../../install.sh#L28)
+**Configuration management** — **Load Saved Config**, **Interactive Configuration** (`prompt` / `prompt_port`), **Save Configuration** (`cat` HEREDOC `.install.conf`).
 
-**Configuration management**
+**Deployment** — **Idempotency Check** (running / stopped / fresh path), **`COMPOSE_FILE` HEREDOC**, **`docker compose up -d`**, readiness polling.
 
-- Config loading with corruption handling and config file generation
-  [`install.sh:102`](../../install.sh#L102)
-- [`install.sh:139`](../../install.sh#L139)
-
-**Deployment**
-
-- Docker compose file generation and deploy with retry loop
-  [`install.sh:175`](../../install.sh#L175)
-
-**Shared library**
-
-- Logging functions used throughout the installer
-  [`lib/log.sh:1`](../../lib/log.sh#L1)
+**Shared library** — [`lib/log.sh`](../../lib/log.sh) (`log_*`, **`die`**, **`banner`**).
 
 ### Review Findings
 
-- [x] [Review][Patch] `die` called before `lib/log.sh` defines it — On `SCRIPT_DIR` resolution or empty-dir failure, the script invokes `die` (and `source … || die`) before `die` exists, producing a confusing error or `command not found` instead of the intended message. [install.sh:28–31](../../install.sh#L28)
-- [x] [Review][Patch] Spec I/O matrix calls for validating the custom port is **available** on the host — `valid_port` only checks numeric range; nothing tests bind conflicts (e.g. `ss`/socket probe) before writing compose and deploying. [install.sh:153–166](../../install.sh#L153)
-- [x] [Review][Patch] Internet check hard-fails if `hub.docker.com` is unreachable — First-time deploy still needs registry access for `docker compose up`, but transient HTTP/proxy issues here can block installs that would otherwise work; consider a warning or tying the check to an actual `docker compose pull` outcome. [install.sh:109–112](../../install.sh#L109)
+- [x] [Review][Patch] `die` called before `lib/log.sh` defines it — **Resolved:** bootstrap uses `printf`/exit until `lib/log.sh` is sourced [`install.sh` — `# Load Shared Library`](../../install.sh)
+- [x] [Review][Patch] Host port availability — **Resolved:** **`ensure_publish_ports_free_for_compose_deploy`** + **`ss`** on fresh deploy branch [`install.sh` — `# Interactive Configuration` / `# Idempotency Check`](../../install.sh)
+- [x] [Review][Patch] Registry reachability probe — **Resolved:** **`log_warn`** for hub.docker.com; non-fatal [`install.sh` — `# Pre-flight Checks`](../../install.sh)
