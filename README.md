@@ -37,6 +37,12 @@ The Makefile is the universal execution interface. Every target produces consist
 
 All targets except `help` and `install-hooks` delegate to the dev-toolchain Docker container (`ghcr.io/devrail-dev/dev-toolchain:v1`).
 
+## Portainer on Ubuntu
+
+On Ubuntu **22.04** or **24.04**, run `sudo ./install.sh` (or `sudo ./install.sh -y` for unattended mode). Use `./install.sh --help` for a short synopsis. If Docker Engine or the Compose v2 plugin is missing, the script configures Docker’s official apt repository and installs them, then deploys Portainer CE with Docker Compose.
+
+When invoked via `sudo` from a normal login (i.e. `SUDO_USER` is set and is not `root`), that user is added to the **`docker`** group so they can run `docker` without sudo — log out / back in (or run `newgrp docker`) for the new group to take effect. If you ran the script directly as `root` (no `SUDO_USER`), or via a non-sudo elevation tool, the group step is skipped with a warning; you can grant access manually with `sudo usermod -aG docker <user>`.
+
 ## Configuration
 
 ### `.devrail.yml`
