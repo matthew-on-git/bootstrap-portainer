@@ -342,8 +342,14 @@ ensure_publish_ports_free_for_compose_deploy() {
   [[ "$http" != "$edge" ]] || die "HTTPS port and Edge port must differ (both are ${http})"
 
   local p
+  # Use `if` rather than `tcp_port_listening "$p" && die ...`: when no port is
+  # in use, `tcp_port_listening` returns 1 and the && compound also returns 1,
+  # which becomes the function's exit status and causes `set -e` to kill the
+  # script immediately after the "Deployment" banner.
   for p in "$http" "$edge"; do
-    tcp_port_listening "$p" && die "TCP port ${p} is already in use — choose another value or stop the conflicting service"
+    if tcp_port_listening "$p"; then
+      die "TCP port ${p} is already in use — choose another value or stop the conflicting service"
+    fi
   done
 }
 
