@@ -28,6 +28,8 @@ setup() {
     "${SANDBOX}/lib" \
     "${SANDBOX}/etc/apt/sources.list.d" \
     "${SANDBOX}/etc/apt/keyrings" \
+    "${SANDBOX}/etc/letsencrypt/live" \
+    "${SANDBOX}/etc/letsencrypt/renewal-hooks/deploy" \
     "${SANDBOX}/run/systemd/system" \
     "${SANDBOX}/opt/portainer" \
     "${MOCK_DIR}/bin" \
@@ -52,9 +54,14 @@ EOF
     -e "s|/etc/apt/keyrings|${SANDBOX}/etc/apt/keyrings|g" \
     -e "s|/etc/apt/sources.list.d/docker.list|${SANDBOX}/etc/apt/sources.list.d/docker.list|g" \
     -e "s|/run/systemd/system|${SANDBOX}/run/systemd/system|g" \
+    -e "s|LETSENCRYPT_DIR=\"/etc/letsencrypt\"|LETSENCRYPT_DIR=\"${SANDBOX}/etc/letsencrypt\"|g" \
     -e "s|INSTALL_DIR_DEFAULT=\"/opt/portainer\"|INSTALL_DIR_DEFAULT=\"${SANDBOX}/opt/portainer\"|g" \
     "${ROOT}/install.sh" > "${SANDBOX}/install.sh"
   chmod +x "${SANDBOX}/install.sh"
+
+  # The TLS bootstrap shells out to `certbot` and `openssl`. Tests need to see
+  # call traces and control behavior (cert valid / not valid).
+  export SANDBOX_LETSENCRYPT_DIR="${SANDBOX}/etc/letsencrypt"
 
   _install_stubs
 
@@ -219,6 +226,44 @@ STUB
 
   cat > "$b/sleep" <<'STUB'
 #!/usr/bin/env bash
+exit 0
+STUB
+
+  cat > "$b/certbot" <<'STUB'
+#!/usr/bin/env bash
+printf 'certbot %s\n' "$*" >> "${MOCK_DIR}/calls.log"
+domain=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d) domain="$2"; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+# Test scenario hook: optionally make certbot fail.
+[[ -f "${MOCK_DIR}/state/certbot_fail" ]] && exit 1
+# Drop a fake cert at the expected sandbox path so subsequent install.sh
+# checks (cert presence, compose generation) succeed.
+if [[ -n "$domain" && -n "${SANDBOX_LETSENCRYPT_DIR:-}" ]]; then
+  mkdir -p "${SANDBOX_LETSENCRYPT_DIR}/live/${domain}"
+  printf 'mock-fullchain\n' > "${SANDBOX_LETSENCRYPT_DIR}/live/${domain}/fullchain.pem"
+  printf 'mock-privkey\n'   > "${SANDBOX_LETSENCRYPT_DIR}/live/${domain}/privkey.pem"
+fi
+exit 0
+STUB
+
+  cat > "$b/openssl" <<'STUB'
+#!/usr/bin/env bash
+printf 'openssl %s\n' "$*" >> "${MOCK_DIR}/calls.log"
+# Used by cert_is_valid_for_at_least: openssl x509 -in <cert> -noout -checkend N
+# Default: pretend the cert is NOT valid (return 1) so install.sh proceeds to
+# call certbot. Tests opt in to the "skip certbot" path by touching
+# state/openssl_cert_valid.
+case "$1" in
+  x509)
+    [[ -f "${MOCK_DIR}/state/openssl_cert_valid" ]] && exit 0
+    exit 1
+    ;;
+esac
 exit 0
 STUB
 
@@ -481,4 +526,155 @@ EOF
   grep -Fq 'image: portainer/portainer-ce:sts' "${SANDBOX}/opt/portainer/docker-compose.yaml"
   # Compose up -d invoked.
   grep -q 'compose .*up -d' "${CALLS_LOG}"
+}
+
+# -- v3: TLS_MODE branches ----------------------------------------------------
+
+@test "AC#12: TLS_MODE=off (default) → no certbot, no bind-mount, no --sslcert" {
+  run bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  ! grep -q '^certbot ' "${CALLS_LOG}"
+  ! grep -Fq -- '--sslcert' "${SANDBOX}/opt/portainer/docker-compose.yaml"
+  ! grep -Fq '/certs:ro' "${SANDBOX}/opt/portainer/docker-compose.yaml"
+}
+
+@test "AC#13: TLS_MODE=letsencrypt-http → certbot --standalone called, compose has --sslcert/--sslkey" {
+  run env TLS_MODE=letsencrypt-http \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  grep -Fq 'certbot certonly --standalone' "${CALLS_LOG}"
+  grep -Fq -- '-d portainer.example.com' "${CALLS_LOG}"
+  grep -Fq -- '-m ops@example.com'       "${CALLS_LOG}"
+
+  local compose="${SANDBOX}/opt/portainer/docker-compose.yaml"
+  grep -Fq -- '--sslcert /certs/live/portainer.example.com/fullchain.pem' "$compose"
+  grep -Fq -- '--sslkey /certs/live/portainer.example.com/privkey.pem'    "$compose"
+  grep -Fq "${SANDBOX}/etc/letsencrypt:/certs:ro" "$compose"
+
+  # Renewal hook deployed and executable.
+  local hook="${SANDBOX}/etc/letsencrypt/renewal-hooks/deploy/portainer.sh"
+  [ -f "$hook" ]
+  [ -x "$hook" ]
+  grep -Fq 'docker restart portainer' "$hook"
+}
+
+@test "AC#14: TLS_MODE=letsencrypt-http with port 80 in use → die before certbot" {
+  printf '*:80\n' > "$(_state mock_ss_listeners)"
+
+  run env TLS_MODE=letsencrypt-http \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"port 80 free"* ]]
+  ! grep -Fq 'certbot certonly --standalone' "${CALLS_LOG}"
+}
+
+@test "AC#15: TLS_MODE=dns-cloudflare → CF creds written 0600, certbot --dns-cloudflare called" {
+  run env TLS_MODE=dns-cloudflare \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          CF_API_TOKEN=secret-token-xyz \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  grep -Fq 'certbot certonly --dns-cloudflare' "${CALLS_LOG}"
+  grep -Fq -- '--dns-cloudflare-credentials' "${CALLS_LOG}"
+
+  local creds="${SANDBOX}/etc/letsencrypt/.cloudflare-credentials"
+  [ -f "$creds" ]
+  [ "$(stat -c '%a' "$creds")" = "600" ]
+  grep -Fq 'dns_cloudflare_api_token = secret-token-xyz' "$creds"
+
+  # Token must NOT leak into stdout/stderr or .install.conf.
+  ! [[ "$output" == *"secret-token-xyz"* ]]
+  ! grep -Fq 'secret-token-xyz' "${SANDBOX}/opt/portainer/.install.conf"
+  ! grep -Eq '^CF_API_TOKEN' "${SANDBOX}/opt/portainer/.install.conf"
+}
+
+@test "AC#16: cert already valid for >= 30 days → skip certbot" {
+  # Pre-stage a fake cert and tell the openssl stub to report it valid.
+  mkdir -p "${SANDBOX}/etc/letsencrypt/live/portainer.example.com"
+  printf 'pre-existing-fullchain\n' > "${SANDBOX}/etc/letsencrypt/live/portainer.example.com/fullchain.pem"
+  printf 'pre-existing-privkey\n'   > "${SANDBOX}/etc/letsencrypt/live/portainer.example.com/privkey.pem"
+  _set_state openssl_cert_valid
+
+  run env TLS_MODE=letsencrypt-http \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  # certbot apt install still happens (cheap, idempotent), but the cert
+  # acquisition itself is skipped.
+  ! grep -Fq 'certbot certonly --standalone' "${CALLS_LOG}"
+  [[ "$output" == *"valid for at least 30 days"* ]]
+}
+
+@test "AC#18: TLS drift while container running → warn + exit 0" {
+  # Pre-existing config saved as TLS off; container running.
+  cat > "${SANDBOX}/opt/portainer/.install.conf" <<EOF
+INSTALL_DIR="${SANDBOX}/opt/portainer"
+PORTAINER_HTTP_PORT="9443"
+PORTAINER_EDGE_PORT="8000"
+PORTAINER_IMAGE="portainer/portainer-ce:sts"
+TLS_MODE="off"
+DOMAIN=""
+CERTBOT_EMAIL=""
+EOF
+  _set_state portainer_running
+
+  # Operator now requests dns-cloudflare via env.
+  run env TLS_MODE=dns-cloudflare \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          CF_API_TOKEN=token \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Configuration drift detected"* ]]
+  [[ "$output" == *"docker rm -f portainer"* ]]
+  # No cert work: the drift bail happens before TLS bootstrap.
+  ! grep -Fq 'certbot ' "${CALLS_LOG}"
+}
+
+@test "AC#20: TLS_MODE=letsencrypt-http does NOT install nginx/Caddy/Traefik" {
+  run env TLS_MODE=letsencrypt-http \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  ! grep -Eq 'apt-get install .* nginx'   "${CALLS_LOG}"
+  ! grep -Eq 'apt-get install .* caddy'   "${CALLS_LOG}"
+  ! grep -Eq 'apt-get install .* traefik' "${CALLS_LOG}"
+}
+
+@test "v3: dns-cloudflare without token AND no creds file → die" {
+  run env TLS_MODE=dns-cloudflare \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"CF_API_TOKEN is required"* ]]
+  ! grep -Fq 'certbot ' "${CALLS_LOG}"
+}
+
+@test "v3: dns-cloudflare with pre-existing creds file → reuse (no token prompt)" {
+  install -m 0600 -D /dev/stdin "${SANDBOX}/etc/letsencrypt/.cloudflare-credentials" <<<'dns_cloudflare_api_token = pre-existing-token'
+
+  run env TLS_MODE=dns-cloudflare \
+          DOMAIN=portainer.example.com \
+          CERTBOT_EMAIL=ops@example.com \
+          bash "${SANDBOX}/install.sh" -y
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Reusing Cloudflare API token"* ]]
+  grep -Fq 'certbot certonly --dns-cloudflare' "${CALLS_LOG}"
 }

@@ -2,11 +2,14 @@
 title: 'Bootstrap Portainer CE Installation Script (v2 — Docker bootstrap on bare Ubuntu)'
 type: 'feature'
 created: '2026-05-06'
-status: 'done'
+status: 'superseded'
 context: []
 baseline_commit: '636987e700cfa99801e0dfb93929dea4f5ba6187'
 supersedes: 'spec-install-script.md'
+superseded_by: 'spec-install-script-v3.md'
 ---
+
+> **⚠ Superseded — historical record.** This v2 contract is preserved verbatim for traceability. The authoritative spec is now [`spec-install-script-v3.md`](./spec-install-script-v3.md), which extends v2 with optional Let's Encrypt TLS for Portainer's HTTPS endpoint. v3 carries v2's contract verbatim for `TLS_MODE=off` (the v3 default), so behavior on existing v2 installs is unchanged.
 
 > **Renegotiated revision.** This spec formally renegotiates the [v1 frozen contract](./spec-install-script.md) to allow `install.sh` to install Docker Engine + Compose v2 on bare Ubuntu cloud images, detect the OS without `lsb_release`, and grant the invoking sudo user access to the `docker` group. v1 is preserved for traceability and is marked `superseded`.
 
