@@ -35,7 +35,7 @@ All targets except `help` and `install-hooks` delegate to the dev-toolchain Dock
 
 ## Bootstrapping Portainer CE
 
-The authoritative spec is [`spec-install-script-v2.md`](_bmad-output/implementation-artifacts/spec-install-script-v2.md).
+The authoritative spec is [`spec-install-script-v3.md`](_bmad-output/implementation-artifacts/spec-install-script-v3.md).
 
 ### Requirements
 
@@ -62,9 +62,48 @@ The first run writes `${INSTALL_DIR}/.install.conf` with the values you accepted
 | Setting | Default | Notes |
 |---|---|---|
 | `INSTALL_DIR` | `/opt/portainer` | Holds `.install.conf` and the generated `docker-compose.yaml` |
-| `PORTAINER_HTTP_PORT` | `9443` | Host port for Portainer's HTTPS UI; mapped to container `9443` |
+| `PORTAINER_HTTP_PORT` | `9443` | Host port for Portainer's HTTPS UI; mapped to container `9443`. Set to `443` when you want the UI directly on https://`${DOMAIN}`/ with a real TLS cert. |
 | `PORTAINER_EDGE_PORT` | `8000` | Host port for Portainer's Edge tunnel; mapped to container `8000` |
 | `PORTAINER_IMAGE` | `portainer/portainer-ce:sts` | Pinned tag — `:latest` and unpinned tags are rejected at runtime regardless of source (defaults, saved config, interactive input) |
+| `TLS_MODE` | `off` | `off` \| `letsencrypt-http` \| `dns-cloudflare`. Selects the cert source for Portainer's own HTTPS endpoint. See **TLS** below. |
+| `DOMAIN` | _(empty)_ | FQDN that resolves to this host. Required when `TLS_MODE != off`. |
+| `CERTBOT_EMAIL` | _(empty)_ | Contact email for Let's Encrypt registration / expiry notices. Required when `TLS_MODE != off`. |
+| `CF_API_TOKEN` | _(empty)_ | Cloudflare API token with `Zone:Edit` on the relevant zone. Required when `TLS_MODE = dns-cloudflare`. **Stored at `/etc/letsencrypt/.cloudflare-credentials` (chmod 0600), never in `.install.conf`.** |
+
+### TLS
+
+`install.sh` can replace Portainer's built-in self-signed HTTPS cert with a real Let's Encrypt cert, fed directly to Portainer via its native `--sslcert` / `--sslkey` flags. **No host reverse proxy is installed** — there is no nginx / Caddy / Traefik in the picture; just `certbot` on the host and a bind-mount of `/etc/letsencrypt` into the Portainer container.
+
+Three modes are supported via the `TLS_MODE` knob:
+
+- **`off`** (default) — Portainer serves its self-signed cert as before. No new packages are installed and no `/etc/letsencrypt` plumbing happens. v2 behavior preserved verbatim.
+- **`letsencrypt-http`** — Obtain a cert via the ACME HTTP-01 challenge using `certbot certonly --standalone`. Requires port `80` to be free on the host while the cert is acquired or renewed.
+- **`dns-cloudflare`** — Obtain a cert via the ACME DNS-01 challenge against Cloudflare's API using `certbot certonly --dns-cloudflare`. No port `80` requirement; useful when the host is behind a NAT or you want a wildcard cert.
+
+Set the knobs interactively at the prompts, via env vars on a single command line, or by pre-populating `.install.conf`:
+
+```bash
+sudo TLS_MODE=letsencrypt-http \
+     DOMAIN=portainer.example.com \
+     CERTBOT_EMAIL=ops@example.com \
+     ./install.sh -y
+
+sudo TLS_MODE=dns-cloudflare \
+     DOMAIN=portainer.example.com \
+     CERTBOT_EMAIL=ops@example.com \
+     CF_API_TOKEN=cf_xxx_zone_edit_token \
+     ./install.sh -y
+```
+
+Renewal is delegated to Debian's bundled `certbot.timer` (no custom cron / systemd unit). After each successful `certbot renew`, a deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/portainer.sh` runs `docker restart portainer` so the new cert is loaded — Portainer reads its certs once at startup and does not watch the files.
+
+Test renewal end-to-end with a dry run:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+**Reconfiguration caveat.** Changing `TLS_MODE` or `DOMAIN` while the `portainer` container is already running will **not** take effect on a re-run — `install.sh` keeps v2 idempotency strictly and exits 0 on a running container. The script will print a `Configuration drift detected` warning and instruct you to `docker rm -f portainer` and re-run to apply the new TLS config.
 
 ### Docker group access
 
@@ -100,6 +139,10 @@ The first plain `docker ps` (no `sudo`) only succeeds after you have logged out 
 - **`systemd is required (/run/systemd/system not found)`** — the host is not running systemd as init. The script does not support these environments; run Portainer manually via `docker compose` instead.
 - **`Unsupported architecture for Docker upstream apt`** — the host architecture is outside Docker's published apt channels. Install Docker manually via your distribution's packages, then re-run `install.sh`.
 - **`PORTAINER_IMAGE must not use the :latest tag`** — pin a stable tag like `portainer/portainer-ce:sts`. The contract rejects `:latest` so re-runs are reproducible.
+- **`TLS_MODE=letsencrypt-http needs port 80 free`** — `certbot --standalone` binds port 80 transiently for ACME HTTP-01. Stop the conflicting service for the duration, or switch to `TLS_MODE=dns-cloudflare` (which uses the Cloudflare API instead of port 80).
+- **`certbot --standalone failed`** / **`certbot --dns-cloudflare failed`** — see `/var/log/letsencrypt/letsencrypt.log` for the underlying error. Common causes: DNS does not resolve to this host (HTTP-01); CF token lacks `Zone:Edit` on the relevant zone (DNS-01); rate-limit hit (`certbot` documents the LE rate limits).
+- **`Configuration drift detected`** — you changed `TLS_MODE` or `DOMAIN` between runs while the `portainer` container is still up. Re-runs are intentionally idempotent and will not recreate the container; `sudo docker rm -f portainer` and re-run to apply the new TLS config.
+- **Cert renewed but Portainer still serves the old cert** — verify the deploy hook is in place and executable: `ls -l /etc/letsencrypt/renewal-hooks/deploy/portainer.sh`. Re-running `install.sh` re-installs the hook idempotently if it has been removed.
 
 ## Configuration
 

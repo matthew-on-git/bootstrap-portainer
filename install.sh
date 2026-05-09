@@ -21,6 +21,18 @@ PORTAINER_IMAGE_DEFAULT="portainer/portainer-ce:sts"
 
 CONF_FILE=".install.conf"
 
+# v3: optional Let's Encrypt TLS for Portainer's own HTTPS endpoint.
+# Default is "off" so existing v2 installs are not disturbed.
+TLS_MODE_DEFAULT="off"
+DOMAIN_DEFAULT=""
+CERTBOT_EMAIL_DEFAULT=""
+
+# Read-only host paths used by the LE bootstrap. Sed-redirected by the test
+# harness to a per-test sandbox.
+LETSENCRYPT_DIR="/etc/letsencrypt"
+CF_CREDENTIALS_FILE="${LETSENCRYPT_DIR}/.cloudflare-credentials"
+RENEWAL_HOOK_PATH="${LETSENCRYPT_DIR}/renewal-hooks/deploy/portainer.sh"
+
 ######################################################################
 # Load Shared Library
 ######################################################################
@@ -74,8 +86,15 @@ Side effects:
   When invoked via sudo from a normal login (SUDO_USER set, not root), that user is
   added to the docker group. Log out / back in (or run: newgrp docker) to take effect.
 
+TLS environment overrides (used to seed prompts; persisted to .install.conf except CF_API_TOKEN):
+  TLS_MODE        off | letsencrypt-http | dns-cloudflare   (default: off)
+  DOMAIN          FQDN that resolves to this host          (required when TLS_MODE != off)
+  CERTBOT_EMAIL   contact email for Let's Encrypt          (required when TLS_MODE != off)
+  CF_API_TOKEN    Cloudflare API token w/ Zone:Edit        (required when TLS_MODE = dns-cloudflare)
+                  Stored at /etc/letsencrypt/.cloudflare-credentials chmod 600 — never in .install.conf.
+
 Default Ports:
-  HTTPS UI: 9443
+  HTTPS UI: 9443  (suggest 443 when TLS_MODE != off)
   Edge Tunnel: 8000
 USAGE
     exit 0
@@ -228,6 +247,141 @@ ensure_docker_daemon_and_compose() {
   docker info &>/dev/null || die "Docker daemon unreachable after installation — check: journalctl -u docker.service"
 }
 
+######################################################################
+# TLS bootstrap (v3 — optional Let's Encrypt for Portainer's HTTPS)
+######################################################################
+
+valid_tls_mode() {
+  case "${1:-}" in
+  off | letsencrypt-http | dns-cloudflare) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Loose FQDN check — rejects empty, leading/trailing dot, double-dot, spaces.
+# Real validation happens at certbot time; this guard catches obvious typos
+# before we apt-install anything or call certbot.
+valid_domain() {
+  local d="${1:-}"
+  [[ -n "$d" ]] || return 1
+  [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+
+# Returns 0 if the cert at $1 is valid for at least $2 seconds. Used to skip
+# re-acquisition on idempotent re-runs.
+cert_is_valid_for_at_least() {
+  local cert="$1" seconds="$2"
+  [[ -f "$cert" ]] || return 1
+  command -v openssl &>/dev/null || return 1
+  openssl x509 -in "$cert" -noout -checkend "$seconds" &>/dev/null
+}
+
+install_certbot_for_tls_mode() {
+  local mode="$1"
+  case "$mode" in
+  off) return 0 ;;
+  letsencrypt-http)
+    log_info "Installing certbot from the Ubuntu archive (TLS_MODE=letsencrypt-http)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot \
+      || die "Failed to install certbot"
+    ;;
+  dns-cloudflare)
+    log_info "Installing certbot + python3-certbot-dns-cloudflare (TLS_MODE=dns-cloudflare)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-dns-cloudflare \
+      || die "Failed to install certbot and python3-certbot-dns-cloudflare"
+    ;;
+  *)
+    die "Unknown TLS_MODE for certbot install: $mode"
+    ;;
+  esac
+}
+
+# Write the Cloudflare credentials file with strict perms. Idempotent: the
+# previous content (if any) is overwritten only when the supplied token differs
+# from what is already on disk, so re-runs do not churn the file mtime needlessly.
+write_cloudflare_credentials() {
+  local token="$1"
+  [[ -n "$token" ]] || die "CF_API_TOKEN is empty — cannot write Cloudflare credentials"
+
+  install -m 0700 -d "$LETSENCRYPT_DIR"
+  local desired="dns_cloudflare_api_token = ${token}"
+  if [[ -f "$CF_CREDENTIALS_FILE" ]] \
+    && [[ "$(cat "$CF_CREDENTIALS_FILE" 2>/dev/null)" == "$desired" ]] \
+    && [[ "$(stat -c '%a' "$CF_CREDENTIALS_FILE" 2>/dev/null)" == "600" ]]; then
+    return 0
+  fi
+  local tmp="${CF_CREDENTIALS_FILE}.tmp.$$"
+  printf '%s\n' "$desired" >"$tmp" || die "Failed to write Cloudflare credentials"
+  install -m 0600 -o root -g root "$tmp" "$CF_CREDENTIALS_FILE" \
+    || { rm -f "$tmp"; die "Failed to install Cloudflare credentials at $CF_CREDENTIALS_FILE"; }
+  rm -f "$tmp"
+}
+
+obtain_letsencrypt_cert() {
+  local mode="$1" domain="$2" email="$3"
+  local cert="${LETSENCRYPT_DIR}/live/${domain}/fullchain.pem"
+
+  # Skip when a valid cert is already on disk (>= 30 days remaining). The
+  # certbot.timer handles renewal — install.sh re-runs are not the renewal path.
+  if cert_is_valid_for_at_least "$cert" $(( 30 * 86400 )); then
+    log_info "Existing cert at ${cert} is valid for at least 30 days — skipping certbot"
+    return 0
+  fi
+
+  case "$mode" in
+  letsencrypt-http)
+    if tcp_port_listening 80; then
+      die "TLS_MODE=letsencrypt-http needs port 80 free for certbot --standalone (something is listening). Stop the conflicting service or pick TLS_MODE=dns-cloudflare."
+    fi
+    log_info "Obtaining Let's Encrypt cert via HTTP-01 (certbot --standalone) for ${domain}..."
+    certbot certonly --standalone --non-interactive --agree-tos \
+      -d "$domain" -m "$email" \
+      || die "certbot --standalone failed for ${domain} — see /var/log/letsencrypt for details"
+    ;;
+  dns-cloudflare)
+    log_info "Obtaining Let's Encrypt cert via DNS-01 (Cloudflare) for ${domain}..."
+    # Cloudflare's DNS propagation is fast but not instant; the default 10s
+    # propagation wait is too aggressive for some networks.
+    certbot certonly --dns-cloudflare --non-interactive --agree-tos \
+      --dns-cloudflare-credentials "$CF_CREDENTIALS_FILE" \
+      --dns-cloudflare-propagation-seconds 30 \
+      -d "$domain" -m "$email" \
+      || die "certbot --dns-cloudflare failed for ${domain} — see /var/log/letsencrypt for details"
+    ;;
+  off)
+    return 0
+    ;;
+  *)
+    die "Unknown TLS_MODE: $mode"
+    ;;
+  esac
+
+  [[ -f "$cert" ]] || die "Expected cert at $cert after certbot run, but it is missing"
+}
+
+# Portainer reads --sslcert / --sslkey once at startup and does not watch the
+# files. After each renewal we restart the container so the new cert is loaded.
+write_portainer_renewal_hook() {
+  install -m 0755 -d "$(dirname "$RENEWAL_HOOK_PATH")"
+  local desired
+  desired=$(cat <<'HOOK'
+#!/bin/sh
+# Generated by bootstrap-portainer install.sh — do not edit by hand.
+# Restart the Portainer container so it picks up the freshly renewed cert.
+exec docker restart portainer
+HOOK
+)
+  if [[ -f "$RENEWAL_HOOK_PATH" ]] && [[ "$(cat "$RENEWAL_HOOK_PATH" 2>/dev/null)" == "$desired" ]]; then
+    chmod 0755 "$RENEWAL_HOOK_PATH" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s\n' "$desired" >"$RENEWAL_HOOK_PATH" \
+    || die "Failed to write renewal hook at $RENEWAL_HOOK_PATH"
+  chmod 0755 "$RENEWAL_HOOK_PATH" \
+    || die "Failed to chmod renewal hook at $RENEWAL_HOOK_PATH"
+  log_info "Renewal hook installed at $RENEWAL_HOOK_PATH"
+}
+
 # Non-root docker CLI access: add the account that invoked sudo to group `docker`.
 add_sudo_invoker_to_docker_group() {
   local u="${SUDO_USER:-}"
@@ -295,16 +449,43 @@ PORTAINER_HTTP_PORT="$PORTAINER_HTTP_PORT_DEFAULT"
 PORTAINER_EDGE_PORT="$PORTAINER_EDGE_PORT_DEFAULT"
 PORTAINER_IMAGE="$PORTAINER_IMAGE_DEFAULT"
 
+# v3 TLS knobs. Defaults seeded here; overridden in this priority:
+#   env var (highest) > saved .install.conf value > default (lowest)
+# CF_API_TOKEN is intentionally NOT initialized from any saved file — the
+# token lives at /etc/letsencrypt/.cloudflare-credentials only.
+TLS_MODE="${TLS_MODE:-$TLS_MODE_DEFAULT}"
+DOMAIN="${DOMAIN:-$DOMAIN_DEFAULT}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-$CERTBOT_EMAIL_DEFAULT}"
+CF_API_TOKEN="${CF_API_TOKEN:-}"
+
 for candidate in "${INSTALL_DIR}/${CONF_FILE}" "${INSTALL_DIR_DEFAULT}/${CONF_FILE}"; do
   if [[ -f "$candidate" ]]; then
     log_info "Loading saved configuration from ${candidate}"
+    # Capture any pre-existing env-var values so a saved .install.conf does
+    # not silently overwrite an explicit CLI override.
+    _env_TLS_MODE="${TLS_MODE}"
+    _env_DOMAIN="${DOMAIN}"
+    _env_CERTBOT_EMAIL="${CERTBOT_EMAIL}"
     # shellcheck source=/dev/null
     if ! source "$candidate" 2>/dev/null; then
       log_warn "Failed to load config from ${candidate} — using defaults"
     fi
+    # Snapshot saved values BEFORE env-precedence restoration so drift
+    # detection can compare "what the running container was deployed with"
+    # vs "what the operator wants now".
+    SAVED_TLS_MODE="${TLS_MODE}"
+    SAVED_DOMAIN="${DOMAIN}"
+    # Restore env-var precedence for any TLS knob explicitly set on the env.
+    [[ "${_env_TLS_MODE}" != "${TLS_MODE_DEFAULT}" ]] && TLS_MODE="${_env_TLS_MODE}"
+    [[ -n "${_env_DOMAIN}" ]] && DOMAIN="${_env_DOMAIN}"
+    [[ -n "${_env_CERTBOT_EMAIL}" ]] && CERTBOT_EMAIL="${_env_CERTBOT_EMAIL}"
+    unset _env_TLS_MODE _env_DOMAIN _env_CERTBOT_EMAIL
     break
   fi
 done
+# Defaults for the case where no .install.conf existed.
+SAVED_TLS_MODE="${SAVED_TLS_MODE:-$TLS_MODE_DEFAULT}"
+SAVED_DOMAIN="${SAVED_DOMAIN:-}"
 
 ######################################################################
 # Interactive Configuration
@@ -383,9 +564,80 @@ prompt_port() {
 }
 
 prompt INSTALL_DIR "Install directory" "$INSTALL_DIR"
-prompt_port PORTAINER_HTTP_PORT "Portainer HTTPS port (UI)" "$PORTAINER_HTTP_PORT"
+prompt_port PORTAINER_HTTP_PORT "Portainer HTTPS port (UI; suggest 443 when TLS is on)" "$PORTAINER_HTTP_PORT"
 prompt_port PORTAINER_EDGE_PORT "Portainer Edge tunnel port" "$PORTAINER_EDGE_PORT"
 prompt PORTAINER_IMAGE "Portainer image" "$PORTAINER_IMAGE"
+
+# Prompt loop for TLS_MODE — one of off / letsencrypt-http / dns-cloudflare.
+prompt_tls_mode() {
+  local default="$1"
+  if [[ "$AUTO_YES" == "true" ]]; then
+    valid_tls_mode "$default" || die "TLS_MODE='${default}' is not valid (off | letsencrypt-http | dns-cloudflare)"
+    TLS_MODE="$default"
+    return
+  fi
+  local input
+  while true; do
+    read -rp "$(printf "${BLUE}>>>${NC} TLS mode (off | letsencrypt-http | dns-cloudflare) [%s]: " "$default")" input
+    input="${input:-$default}"
+    if valid_tls_mode "$input"; then
+      TLS_MODE="$input"
+      return
+    fi
+    log_error "Invalid TLS_MODE: ${input}. Allowed: off | letsencrypt-http | dns-cloudflare."
+  done
+}
+
+prompt_domain() {
+  local default="$1"
+  if [[ "$AUTO_YES" == "true" ]]; then
+    DOMAIN="$default"
+    return
+  fi
+  local input
+  while true; do
+    read -rp "$(printf "${BLUE}>>>${NC} DOMAIN (FQDN that resolves to this host) [%s]: " "$default")" input
+    input="${input:-$default}"
+    if valid_domain "$input"; then
+      DOMAIN="$input"
+      return
+    fi
+    log_error "Invalid DOMAIN: ${input}. Provide a fully-qualified domain name (e.g. portainer.example.com)."
+  done
+}
+
+# Read a sensitive value with no echo. Falls back to plain prompt if the
+# terminal does not support `read -s`.
+prompt_secret() {
+  local var="$1" msg="$2"
+  if [[ "$AUTO_YES" == "true" ]]; then
+    return
+  fi
+  local input
+  read -rsp "$(printf "${BLUE}>>>${NC} %s: " "$msg")" input
+  printf '\n' >&2
+  printf -v "$var" '%s' "$input"
+}
+
+prompt_tls_mode "$TLS_MODE"
+
+if [[ "$TLS_MODE" != "off" ]]; then
+  prompt_domain "$DOMAIN"
+  prompt CERTBOT_EMAIL "Email for Let's Encrypt registration / expiry notices" "$CERTBOT_EMAIL"
+  [[ -n "$CERTBOT_EMAIL" ]] || die "CERTBOT_EMAIL is required when TLS_MODE != off"
+fi
+
+if [[ "$TLS_MODE" == "dns-cloudflare" ]]; then
+  if [[ -z "$CF_API_TOKEN" ]] && [[ -f "$CF_CREDENTIALS_FILE" ]]; then
+    log_info "Reusing Cloudflare API token already present at $CF_CREDENTIALS_FILE"
+  elif [[ -z "$CF_API_TOKEN" ]]; then
+    if [[ "$AUTO_YES" == "true" ]]; then
+      die "CF_API_TOKEN is required when TLS_MODE=dns-cloudflare and -y is set (or supply $CF_CREDENTIALS_FILE out of band)"
+    fi
+    prompt_secret CF_API_TOKEN "Cloudflare API token (Zone:Edit on the relevant zone)"
+    [[ -n "$CF_API_TOKEN" ]] || die "CF_API_TOKEN cannot be empty for TLS_MODE=dns-cloudflare"
+  fi
+fi
 
 # Spec contract: never use unpinned tags. Reject `:latest` (or no tag at all)
 # whether sourced from a saved .install.conf, an interactive prompt, or the
@@ -407,6 +659,10 @@ INSTALL_DIR="${INSTALL_DIR}"
 PORTAINER_HTTP_PORT="${PORTAINER_HTTP_PORT}"
 PORTAINER_EDGE_PORT="${PORTAINER_EDGE_PORT}"
 PORTAINER_IMAGE="${PORTAINER_IMAGE}"
+TLS_MODE="${TLS_MODE}"
+DOMAIN="${DOMAIN}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL}"
+# CF_API_TOKEN intentionally NOT persisted here — see ${CF_CREDENTIALS_FILE}
 CONF
 chmod 600 "${INSTALL_DIR}/${CONF_FILE}" || die "Failed to set permissions on config file"
 log_info "Configuration saved"
@@ -417,16 +673,44 @@ log_info "Configuration saved"
 
 banner "Deployment"
 
+# Drift detection: if the prompted/env TLS knobs differ from what was last
+# saved (and is presumably what the running container was deployed with),
+# warn the operator that the running container will not pick up the new config.
+warn_tls_drift_if_running() {
+  if [[ "$TLS_MODE" != "$SAVED_TLS_MODE" ]] || [[ "$DOMAIN" != "$SAVED_DOMAIN" ]]; then
+    log_warn "Configuration drift detected against the running container:"
+    log_warn "  saved: TLS_MODE=${SAVED_TLS_MODE} DOMAIN=${SAVED_DOMAIN:-<unset>}"
+    log_warn "  now:   TLS_MODE=${TLS_MODE}      DOMAIN=${DOMAIN:-<unset>}"
+    log_warn "Run 'docker rm -f portainer' and re-run install.sh to apply the new TLS config."
+  fi
+}
+
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^portainer$"; then
+  warn_tls_drift_if_running
   log_info "Portainer container is already running — nothing to do"
   exit 0
 fi
 
 if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^portainer$"; then
+  warn_tls_drift_if_running
   log_info "Portainer container exists but is stopped — starting..."
   docker start portainer
   log_info "Portainer started successfully"
   exit 0
+fi
+
+# Fresh deploy path: do TLS bootstrap (cert acquisition + renewal hook) before
+# port-collision check, because TLS_MODE=letsencrypt-http needs port 80 free
+# during certbot --standalone, and we want that failure to surface here, not
+# during the unrelated 9443/8000 port check.
+if [[ "$TLS_MODE" != "off" ]]; then
+  banner "TLS Bootstrap"
+  install_certbot_for_tls_mode "$TLS_MODE"
+  if [[ "$TLS_MODE" == "dns-cloudflare" && -n "$CF_API_TOKEN" ]]; then
+    write_cloudflare_credentials "$CF_API_TOKEN"
+  fi
+  obtain_letsencrypt_cert "$TLS_MODE" "$DOMAIN" "$CERTBOT_EMAIL"
+  write_portainer_renewal_hook
 fi
 
 ensure_publish_ports_free_for_compose_deploy "$PORTAINER_HTTP_PORT" "$PORTAINER_EDGE_PORT"
@@ -439,7 +723,8 @@ COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yaml"
 
 log_info "Generating Docker Compose file: ${COMPOSE_FILE}"
 
-cat >"$COMPOSE_FILE" <<COMPOSE || die "Failed to write compose file: $COMPOSE_FILE"
+if [[ "$TLS_MODE" == "off" ]]; then
+  cat >"$COMPOSE_FILE" <<COMPOSE || die "Failed to write compose file: $COMPOSE_FILE"
 services:
   portainer:
     container_name: portainer
@@ -460,6 +745,34 @@ networks:
   default:
     name: portainer_network
 COMPOSE
+else
+  # TLS_MODE != off: feed the LE cert directly to Portainer via --sslcert /
+  # --sslkey, and bind-mount the entire /etc/letsencrypt tree read-only so the
+  # relative symlinks under live/${DOMAIN}/ resolve into archive/${DOMAIN}/.
+  cat >"$COMPOSE_FILE" <<COMPOSE || die "Failed to write compose file: $COMPOSE_FILE"
+services:
+  portainer:
+    container_name: portainer
+    image: ${PORTAINER_IMAGE}
+    restart: always
+    command: --sslcert /certs/live/${DOMAIN}/fullchain.pem --sslkey /certs/live/${DOMAIN}/privkey.pem
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+      - ${LETSENCRYPT_DIR}:/certs:ro
+    ports:
+      - ${PORTAINER_HTTP_PORT}:9443
+      - ${PORTAINER_EDGE_PORT}:8000
+
+volumes:
+  portainer_data:
+    name: portainer_data
+
+networks:
+  default:
+    name: portainer_network
+COMPOSE
+fi
 
 log_info "Docker Compose file created"
 
@@ -478,7 +791,15 @@ for i in 1 2 3 4 5; do
   sleep 2
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^portainer$"; then
     log_info "Portainer CE deployed successfully"
-    log_info "Access Portainer at: https://localhost:${PORTAINER_HTTP_PORT}"
+    if [[ "$TLS_MODE" != "off" ]]; then
+      if [[ "$PORTAINER_HTTP_PORT" == "443" ]]; then
+        log_info "Access Portainer at: https://${DOMAIN}/"
+      else
+        log_info "Access Portainer at: https://${DOMAIN}:${PORTAINER_HTTP_PORT}/"
+      fi
+    else
+      log_info "Access Portainer at: https://localhost:${PORTAINER_HTTP_PORT} (self-signed cert; pass -k to curl)"
+    fi
     exit 0
   fi
 done

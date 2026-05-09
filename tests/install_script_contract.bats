@@ -69,3 +69,63 @@ setup() {
   grep -Eq '^[[:space:]]*die[[:space:]]*\(\)'       "$LOG_LIB"
   grep -Eq '^[[:space:]]*banner[[:space:]]*\(\)'    "$LOG_LIB"
 }
+
+# -- v3 TLS contracts --
+
+@test "v3: TLS_MODE_DEFAULT is 'off' so v2 installs are not disturbed" {
+  grep -Fq 'TLS_MODE_DEFAULT="off"' "$INSTALL"
+}
+
+@test "v3: install.sh defines the TLS bootstrap functions" {
+  grep -Eq '^valid_tls_mode\(\)'                "$INSTALL"
+  grep -Eq '^valid_domain\(\)'                  "$INSTALL"
+  grep -Eq '^cert_is_valid_for_at_least\(\)'    "$INSTALL"
+  grep -Eq '^install_certbot_for_tls_mode\(\)'  "$INSTALL"
+  grep -Eq '^write_cloudflare_credentials\(\)'  "$INSTALL"
+  grep -Eq '^obtain_letsencrypt_cert\(\)'       "$INSTALL"
+  grep -Eq '^write_portainer_renewal_hook\(\)'  "$INSTALL"
+}
+
+@test "v3: cert files live under /etc/letsencrypt and the renewal hook is at the standard path" {
+  grep -Fq 'LETSENCRYPT_DIR="/etc/letsencrypt"' "$INSTALL"
+  grep -Fq '/etc/letsencrypt/.cloudflare-credentials' "$INSTALL"
+  grep -Fq '/etc/letsencrypt/renewal-hooks/deploy/portainer.sh' "$INSTALL"
+}
+
+@test "v3: Cloudflare credentials are written with 0600 perms via 'install -m'" {
+  grep -Eq 'install -m 0600 .*CF_CREDENTIALS_FILE' "$INSTALL"
+}
+
+@test "v3: CF_API_TOKEN is NEVER persisted into .install.conf" {
+  # The save heredoc must not contain a CF_API_TOKEN= line.
+  awk '/<<CONF/,/^CONF$/' "$INSTALL" | grep -q 'CF_API_TOKEN=' && return 1
+  # Nor anywhere else as a saved-config write target.
+  ! grep -Eq 'CF_API_TOKEN="\$\{CF_API_TOKEN\}"' "$INSTALL"
+}
+
+@test "v3: install.sh does NOT install nginx, Caddy, or Traefik" {
+  ! grep -Eq 'apt-get install .* nginx( |$)' "$INSTALL"
+  ! grep -Eq 'apt-get install .* caddy( |$)' "$INSTALL"
+  ! grep -Eq 'apt-get install .* traefik( |$)' "$INSTALL"
+  ! grep -Eq '/etc/nginx/sites-(available|enabled)' "$INSTALL"
+}
+
+@test "v3: TLS-on compose branch passes --sslcert and --sslkey to Portainer" {
+  grep -Fq -- '--sslcert /certs/live/${DOMAIN}/fullchain.pem' "$INSTALL"
+  grep -Fq -- '--sslkey /certs/live/${DOMAIN}/privkey.pem'   "$INSTALL"
+}
+
+@test "v3: TLS-on compose branch bind-mounts /etc/letsencrypt:/certs:ro" {
+  grep -Fq '${LETSENCRYPT_DIR}:/certs:ro' "$INSTALL"
+}
+
+@test "v3: certbot is invoked with --standalone for HTTP-01 (not --nginx)" {
+  grep -Fq 'certbot certonly --standalone' "$INSTALL"
+  ! grep -Fq 'certbot certonly --nginx' "$INSTALL"
+  ! grep -Fq 'certbot --nginx' "$INSTALL"
+}
+
+@test "v3: certbot is invoked with --dns-cloudflare for DNS-01" {
+  grep -Fq 'certbot certonly --dns-cloudflare' "$INSTALL"
+  grep -Fq -- '--dns-cloudflare-credentials' "$INSTALL"
+}
